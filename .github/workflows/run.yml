@@ -1,0 +1,41 @@
+name: Auto Podcast Clipper
+
+on:
+  schedule:
+    - cron: "30 9 * * *"   # 3:00 PM India time daily
+  workflow_dispatch:         # Manual run button
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install FFmpeg
+        run: sudo apt-get install -y ffmpeg
+
+      - name: Install Python packages
+        run: |
+          pip install yt-dlp
+          pip install openai-whisper
+          pip install google-api-python-client
+          pip install google-auth
+          pip install google-auth-oauthlib
+          pip install pytz
+
+      - name: Run bot
+        env:
+          YT_API_KEY:      ${{ secrets.YT_API_KEY }}
+          MY_CHANNEL_ID:   ${{ secrets.MY_CHANNEL_ID }}
+          OAUTH_TOKEN:     ${{ secrets.OAUTH_TOKEN }}
+          GEMINI_API_KEY:  ${{ secrets.GEMINI_API_KEY }}
+        run: python main.py
