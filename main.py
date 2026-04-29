@@ -15,11 +15,23 @@ API_KEY      = os.environ["YT_API_KEY"]
 CHANNEL_ID   = os.environ["MY_CHANNEL_ID"]
 TOKEN_JSON   = os.environ["OAUTH_TOKEN"]
 GEMINI_KEY   = os.environ["GEMINI_API_KEY"]
+YT_COOKIES   = os.environ.get("YT_COOKIES", "")
 REPO_NAME    = "podcast-auto-clipper"
 LOGO_PATH    = f"/home/runner/work/{REPO_NAME}/{REPO_NAME}/logo.png"
 SEARCH       = "raj shamani viral podcast"
 IST          = pytz.timezone("Asia/Kolkata")
+COOKIES_PATH = "/tmp/cookies.txt"
 # ══════════════════════════════════════════════════════
+
+
+# ── WRITE COOKIES FILE ───────────────────────────────
+def setup_cookies():
+    if YT_COOKIES:
+        with open(COOKIES_PATH, "w") as f:
+            f.write(YT_COOKIES)
+        print("   🍪 YouTube cookies loaded")
+    else:
+        print("   ⚠️  No cookies found — may get blocked")
 
 
 # ── SCHEDULE TIMES ───────────────────────────────────
@@ -80,12 +92,12 @@ Reply ONLY in this exact JSON format, nothing else:
                 data["candidates"][0]["content"]
                     ["parts"][0]["text"].strip()
             )
-            raw  = raw.replace("```json","").replace("```","").strip()
+            raw      = raw.replace("```json","").replace("```","").strip()
             metadata = json.loads(raw)
             print(f"   ✅ Title: {metadata['title']}")
             return metadata
     except Exception as e:
-        print(f"   ⚠️  Gemini AI failed ({e}) — using default")
+        print(f"   ⚠️  Gemini failed ({e}) — using default")
         return {
             "title":       "Raj Shamani Best Moment You Must Watch",
             "description": (
@@ -139,11 +151,24 @@ def already_uploaded(keyword):
 # ── DOWNLOAD ─────────────────────────────────────────
 def download_video(video_id, index):
     print(f"   ⬇️  Downloading video {index}...")
+
     opts = {
         "format":              "bestvideo[height<=720]+bestaudio/best",
         "outtmpl":             f"/tmp/input_{index}.%(ext)s",
-        "merge_output_format": "mp4"
+        "merge_output_format": "mp4",
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
     }
+
+    # Add cookies if available
+    if YT_COOKIES and os.path.exists(COOKIES_PATH):
+        opts["cookiefile"] = COOKIES_PATH
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([
             f"https://www.youtube.com/watch?v={video_id}"
@@ -185,7 +210,7 @@ def make_captions(path, start, end, index):
     # Font    : Arial Narrow
     # Style   : Bold + Italic
     # Size    : 22
-    # Color   : Cyber Yellow (#FFE600)
+    # Color   : Cyber Yellow
     # Outline : Black 3px
     # Shadow  : 1px
     # BG      : Transparent
@@ -343,6 +368,9 @@ def run():
     print("   🤖 AI: Google Gemini Free")
     print("=" * 58)
 
+    # Setup cookies first
+    setup_cookies()
+
     slot1_time, slot2_time = get_schedule_times()
     print(f"\n📅 Short 1 → 4:00 PM IST")
     print(f"📅 Short 2 → 4:15 PM IST")
@@ -360,9 +388,7 @@ def run():
         path                   = download_video(vid_id, index)
         start, end, transcript = find_best_moment(path)
         clip                   = make_clip(path, start, end, index)
-        metadata               = generate_ai_metadata(
-                                     transcript, index
-                                 )
+        metadata               = generate_ai_metadata(transcript, index)
         clips.append((clip, metadata))
         print(f"   ✅ Short {index} prepared")
 
