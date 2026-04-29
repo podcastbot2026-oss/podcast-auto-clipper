@@ -38,4 +38,5 @@ jobs:
           MY_CHANNEL_ID:   ${{ secrets.MY_CHANNEL_ID }}
           OAUTH_TOKEN:     ${{ secrets.OAUTH_TOKEN }}
           GEMINI_API_KEY:  ${{ secrets.GEMINI_API_KEY }}
+          YT_COOKIES:      ${{ secrets.YT_COOKIES }}
         run: python main.py
