@@ -153,9 +153,11 @@ def download_video(video_id, index):
     print(f"   ⬇️  Downloading video {index}...")
 
     opts = {
-        "format":              "bestvideo[height<=720]+bestaudio/best",
+        "format":              "best[ext=mp4]/bestvideo+bestaudio/best",
         "outtmpl":             f"/tmp/input_{index}.%(ext)s",
         "merge_output_format": "mp4",
+        "ignoreerrors":        False,
+        "no_warnings":         False,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -164,7 +166,6 @@ def download_video(video_id, index):
             )
         }
     }
-
     # Add cookies if available
     if YT_COOKIES and os.path.exists(COOKIES_PATH):
         opts["cookiefile"] = COOKIES_PATH
