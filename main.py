@@ -4,32 +4,64 @@ import json
 import urllib.request
 from datetime import datetime
 import pytz
-import yt_dlp
 import whisper
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
 
 # ══════════════════════════════════════════════════════
-API_KEY      = os.environ["YT_API_KEY"]
-CHANNEL_ID   = os.environ["MY_CHANNEL_ID"]
-TOKEN_JSON   = os.environ["OAUTH_TOKEN"]
-GEMINI_KEY   = os.environ["GEMINI_API_KEY"]
-YT_COOKIES   = os.environ.get("YT_COOKIES", "")
-REPO_NAME    = "podcast-auto-clipper"
-LOGO_PATH    = f"/home/runner/work/{REPO_NAME}/{REPO_NAME}/logo.png"
-SEARCH       = "raj shamani viral podcast"
-IST          = pytz.timezone("Asia/Kolkata")
-COOKIES_PATH = "/tmp/cookies.txt"
+API_KEY    = os.environ["YT_API_KEY"]
+CHANNEL_ID = os.environ["MY_CHANNEL_ID"]
+TOKEN_JSON = os.environ["OAUTH_TOKEN"]
+GEMINI_KEY = os.environ["GEMINI_API_KEY"]
+REPO_NAME  = "podcast-auto-clipper"
+BASE_PATH  = f"/home/runner/work/{REPO_NAME}/{REPO_NAME}"
+LOGO_PATH  = f"{BASE_PATH}/logo.png"
+VIDEO_DIR  = f"{BASE_PATH}/videos"
+PROGRESS   = f"{BASE_PATH}/progress.json"
+IST        = pytz.timezone("Asia/Kolkata")
 # ══════════════════════════════════════════════════════
 
 
-# ── WRITE COOKIES FILE ───────────────────────────────
-def setup_cookies():
-    if YT_COOKIES:
-        with open(COOKIES_PATH, "w") as f:
-            f.write(YT_COOKIES)
-        print("   🍪 Cookies loaded")
+# ── GET TODAY'S VIDEO ────────────────────────────────
+def get_todays_video():
+    # Read progress
+    with open(PROGRESS, "r") as f:
+        data = json.load(f)
+    last_index = data.get("last_index", 0)
+
+    # Get all videos sorted
+    videos = sorted([
+        f for f in os.listdir(VIDEO_DIR)
+        if f.endswith(".mp4")
+    ])
+
+    if not videos:
+        print("❌ No videos found in videos/ folder")
+        return None, None, None
+
+    total = len(videos)
+    print(f"   📁 Total videos: {total}")
+
+    # Pick next video
+    next_index = last_index % total
+    video_name = videos[next_index]
+    video_path = os.path.join(VIDEO_DIR, video_name)
+
+    print(f"   🎬 Today's video: {video_name}")
+    print(f"   📌 Index: {next_index + 1} of {total}")
+
+    return video_path, video_name, next_index
+
+
+# ── SAVE PROGRESS ────────────────────────────────────
+def save_progress(index):
+    with open(PROGRESS, "r") as f:
+        data = json.load(f)
+    data["last_index"] = index + 1
+    with open(PROGRESS, "w") as f:
+        json.dump(data, f)
+    print(f"   💾 Progress saved — next run uses video {index + 2}")
 
 
 # ── SCHEDULE TIMES ───────────────────────────────────
@@ -41,7 +73,7 @@ def get_schedule_times():
     return slot1.isoformat(), slot2.isoformat()
 
 
-# ── AI METADATA USING GEMINI (FREE) ──────────────────
+# ── AI METADATA USING GEMINI ─────────────────────────
 def generate_ai_metadata(transcript, slot):
     print(f"   🤖 Gemini generating metadata for Short {slot}...")
 
@@ -80,11 +112,8 @@ Reply ONLY in this exact JSON format, nothing else:
     )
     try:
         with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode())
-            raw  = (
-                data["candidates"][0]["content"]
-                    ["parts"][0]["text"].strip()
-            )
+            data     = json.loads(resp.read().decode())
+            raw      = data["candidates"][0]["content"]["parts"][0]["text"].strip()
             raw      = raw.replace("```json","").replace("```","").strip()
             metadata = json.loads(raw)
             print(f"   ✅ Title: {metadata['title']}")
@@ -92,110 +121,61 @@ Reply ONLY in this exact JSON format, nothing else:
     except Exception as e:
         print(f"   ⚠️  Gemini failed ({e}) — using default")
         return {
-            "title":       "Raj Shamani Best Moment You Must Watch",
-            "description": (
-                "Best moment from Raj Shamani podcast!\n\n"
-                "#Shorts #RajShamani #Podcast #Viral #Motivation"
-            ),
-            "tags": [
-                "rajshamani","podcast","shorts","viral",
-                "motivation","clips","interview","trending",
-                "fyp","podcastclips"
-            ]
+            "title":       "Best Podcast Moment You Must Watch",
+            "description": "Amazing podcast clip!\n\n#Shorts #Podcast #Viral #Motivation",
+            "tags":        ["podcast","shorts","viral","clips","interview",
+                           "motivation","trending","fyp","podcastclips","best"]
         }
 
 
-# ── SEARCH ───────────────────────────────────────────
-def search_podcasts():
-    print(f"🔍 Searching: {SEARCH}")
-    yt  = build("youtube", "v3", developerKey=API_KEY)
-    res = yt.search().list(
-        q=SEARCH,
-        part="snippet",
-        type="video",
-        order="viewCount",
-        videoDuration="long",
-        maxResults=20
-    ).execute()
-    results = [
-        (item["id"]["videoId"], item["snippet"]["title"])
-        for item in res["items"]
-    ]
-    print(f"   Found {len(results)} videos")
-    return results
-
-
-# ── DUPLICATE CHECK ──────────────────────────────────
-def already_uploaded(keyword):
-    yt  = build("youtube", "v3", developerKey=API_KEY)
-    res = yt.search().list(
-        q=keyword,
-        part="snippet",
-        type="video",
-        channelId=CHANNEL_ID,
-        maxResults=3
-    ).execute()
-    exists = len(res.get("items", [])) > 0
-    if exists:
-        print("   ⏭  Already on channel — skipping")
-    return exists
-
-
-# ── DOWNLOAD ─────────────────────────────────────────
-def download_video(video_id, index):
-    print(f"   ⬇️  Downloading video {index}...")
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    out = f"/tmp/input_{index}.mp4"
-
-    opts = {
-        "format":   "best[ext=mp4]/best",
-        "outtmpl":  f"/tmp/input_{index}.%(ext)s",
-        "merge_output_format": "mp4",
-        "quiet":    False,
-        "no_warnings": False,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        }
-    }
-
-    # Add cookies if available
-    if YT_COOKIES and os.path.exists(COOKIES_PATH):
-        opts["cookiefile"] = COOKIES_PATH
-        print("   🍪 Using cookies")
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
-
-    # Handle any extension
-    for ext in ["mp4", "webm", "mkv"]:
-        candidate = f"/tmp/input_{index}.{ext}"
-        if os.path.exists(candidate):
-            if candidate != out:
-                os.rename(candidate, out)
-            print(f"   ✅ Download {index} done")
-            return out
-
-    raise Exception("Downloaded file not found")
-
-
-# ── BEST MOMENT ──────────────────────────────────────
-def find_best_moment(path):
-    print("   🎯 Finding best 60 second moment...")
+# ── FIND 2 BEST MOMENTS FROM ONE VIDEO ───────────────
+def find_two_moments(path):
+    print("   🎯 Finding 2 best moments from video...")
     model  = whisper.load_model("tiny")
     result = model.transcribe(path)
     segs   = result["segments"]
+
     if not segs:
-        return 60, 119, "No transcript available."
-    best      = max(segs, key=lambda s: len(s["text"].split()))
-    start     = max(0, best["start"] - 2)
-    end       = min(best["end"] + 10, start + 59)
+        return (60, 119), (300, 359), "No transcript."
+
+    # Sort all segments by word count descending
+    sorted_segs = sorted(
+        segs,
+        key=lambda s: len(s["text"].split()),
+        reverse=True
+    )
+
     full_text = " ".join(s["text"] for s in segs)
-    print(f"   ✅ Moment: {start:.0f}s → {end:.0f}s")
-    return start, end, full_text
+
+    # Best moment 1 — highest word count segment
+    best1     = sorted_segs[0]
+    start1    = max(0, best1["start"] - 2)
+    end1      = min(best1["end"] + 10, start1 + 59)
+
+    # Best moment 2 — find another segment far from moment 1
+    best2 = None
+    for seg in sorted_segs[1:]:
+        # Must be at least 90 seconds away from moment 1
+        if abs(seg["start"] - start1) > 90:
+            best2 = seg
+            break
+
+    # Fallback if no second moment found far enough
+    if not best2:
+        best2 = sorted_segs[1] if len(sorted_segs) > 1 else sorted_segs[0]
+
+    start2 = max(0, best2["start"] - 2)
+    end2   = min(best2["end"] + 10, start2 + 59)
+
+    # Make sure moment 2 doesn't overlap moment 1
+    if abs(start2 - start1) < 60:
+        start2 = end1 + 30
+        end2   = start2 + 59
+
+    print(f"   ✅ Moment 1: {start1:.0f}s → {end1:.0f}s")
+    print(f"   ✅ Moment 2: {start2:.0f}s → {end2:.0f}s")
+
+    return (start1, end1), (start2, end2), full_text
 
 
 # ── CAPTIONS ─────────────────────────────────────────
@@ -207,7 +187,7 @@ def fmt_time(sec):
 
 
 def make_captions(path, start, end, index):
-    print("   📝 Making Cyber Yellow captions...")
+    print(f"   📝 Making captions for clip {index}...")
     model  = whisper.load_model("tiny")
     result = model.transcribe(path)
 
@@ -245,13 +225,13 @@ def make_captions(path, start, end, index):
     cap = f"/tmp/caps_{index}.ass"
     with open(cap, "w", encoding="utf-8") as f:
         f.write(header + "\n".join(lines))
-    print("   ✅ Captions ready")
+    print(f"   ✅ Captions {index} ready")
     return cap
 
 
-# ── CUT CLIP + LOGO + CAPTIONS ───────────────────────
+# ── MAKE CLIP ─────────────────────────────────────────
 def make_clip(path, start, end, index):
-    print("   ✂️  Cutting clip + logo + captions...")
+    print(f"   ✂️  Making clip {index}...")
     caps = make_captions(path, start, end, index)
     out  = f"/tmp/clip_{index}.mp4"
 
@@ -280,7 +260,6 @@ def make_clip(path, start, end, index):
         ]
         print("   🖼️  Logo: top right")
     else:
-        print("   ⚠️  No logo found")
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(start),
@@ -342,7 +321,6 @@ def upload_scheduled(clip, metadata, publish_time, slot):
 # ── CLEANUP ──────────────────────────────────────────
 def cleanup(index):
     for f in [
-        f"/tmp/input_{index}.mp4",
         f"/tmp/clip_{index}.mp4",
         f"/tmp/caps_{index}.ass"
     ]:
@@ -351,72 +329,68 @@ def cleanup(index):
     print(f"   🧹 Temp files {index} deleted")
 
 
+# ── PUSH PROGRESS TO GITHUB ──────────────────────────
+def push_progress():
+    try:
+        os.system('git config --global user.email "bot@bot.com"')
+        os.system('git config --global user.name "PodcastBot"')
+        os.system(f"git -C {BASE_PATH} add progress.json")
+        os.system(f'git -C {BASE_PATH} commit -m "Update progress"')
+        os.system(f"git -C {BASE_PATH} push")
+        print("   💾 Progress pushed to GitHub")
+    except Exception as e:
+        print(f"   ⚠️  Push failed: {e}")
+
+
 # ── MAIN ─────────────────────────────────────────────
 def run():
     print("=" * 58)
     print("   🚀 PODCAST CLIPPER BOT STARTED")
     print(f"   🕒 {datetime.now(IST).strftime('%I:%M %p IST')}")
-    print(f"   🔍 Search: {SEARCH}")
     print("   🎨 Cyber Yellow · Bold Italic · Size 22")
     print("   🤖 AI: Google Gemini Free")
     print("=" * 58)
 
-    setup_cookies()
+    # Get today's video
+    video_path, video_name, video_index = get_todays_video()
+    if not video_path:
+        return
 
     slot1_time, slot2_time = get_schedule_times()
     print(f"\n📅 Short 1 → 4:00 PM IST")
     print(f"📅 Short 2 → 4:15 PM IST")
 
-    videos = search_podcasts()
-    clips  = []
+    # Find 2 moments from same video
+    (s1, e1), (s2, e2), transcript = find_two_moments(video_path)
 
-    for vid_id, title in videos:
-        if len(clips) == 2:
-            break
+    # Make clip 1
+    print(f"\n🎬 Making Short 1...")
+    clip1     = make_clip(video_path, s1, e1, 1)
+    metadata1 = generate_ai_metadata(transcript, 1)
 
-        print(f"\n📹 Checking: {title[:52]}...")
+    # Make clip 2
+    print(f"\n🎬 Making Short 2...")
+    clip2     = make_clip(video_path, s2, e2, 2)
+    metadata2 = generate_ai_metadata(transcript, 2)
 
-        if already_uploaded(title[:25]):
-            continue
-
-        # ── Try download — skip video if it fails ──
-        try:
-            index = len(clips) + 1
-            path  = download_video(vid_id, index)
-        except Exception as e:
-            print(f"   ⚠️  Skipping — download failed: {e}")
-            continue
-
-        # ── Try processing — skip if it fails ──
-        try:
-            start, end, transcript = find_best_moment(path)
-            clip                   = make_clip(path, start, end, index)
-            metadata               = generate_ai_metadata(transcript, index)
-            clips.append((clip, metadata))
-            print(f"   ✅ Short {index} prepared")
-        except Exception as e:
-            print(f"   ⚠️  Skipping — processing failed: {e}")
-            cleanup(index)
-            continue
-
-    if not clips:
-        print("\nℹ️  No videos could be processed today.")
-        return
-
+    # Upload both scheduled
     print(f"\n📤 Scheduling Short 1 → 4:00 PM IST")
-    upload_scheduled(clips[0][0], clips[0][1], slot1_time, 1)
+    upload_scheduled(clip1, metadata1, slot1_time, 1)
     cleanup(1)
 
-    if len(clips) == 2:
-        print(f"\n📤 Scheduling Short 2 → 4:15 PM IST")
-        upload_scheduled(clips[1][0], clips[1][1], slot2_time, 2)
-        cleanup(2)
+    print(f"\n📤 Scheduling Short 2 → 4:15 PM IST")
+    upload_scheduled(clip2, metadata2, slot2_time, 2)
+    cleanup(2)
+
+    # Save progress — move to next video tomorrow
+    save_progress(video_index)
+    push_progress()
 
     print("\n" + "=" * 58)
-    print("   ✅ DONE!")
+    print("   ✅ BOTH SHORTS SCHEDULED!")
+    print(f"   🎬 From video: {video_name}")
     print("   📅 Short 1 → 4:00 PM IST")
-    if len(clips) == 2:
-        print("   📅 Short 2 → 4:15 PM IST")
+    print("   📅 Short 2 → 4:15 PM IST")
     print("=" * 58)
 
 
