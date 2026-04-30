@@ -4,8 +4,9 @@ import json
 import urllib.request
 from datetime import datetime
 import pytz
-import yt_dlp
 import whisper
+from pytubefix import YouTube
+from pytubefix.cli import on_progress
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
@@ -15,23 +16,11 @@ API_KEY      = os.environ["YT_API_KEY"]
 CHANNEL_ID   = os.environ["MY_CHANNEL_ID"]
 TOKEN_JSON   = os.environ["OAUTH_TOKEN"]
 GEMINI_KEY   = os.environ["GEMINI_API_KEY"]
-YT_COOKIES   = os.environ.get("YT_COOKIES", "")
 REPO_NAME    = "podcast-auto-clipper"
 LOGO_PATH    = f"/home/runner/work/{REPO_NAME}/{REPO_NAME}/logo.png"
 SEARCH       = "raj shamani viral podcast"
 IST          = pytz.timezone("Asia/Kolkata")
-COOKIES_PATH = "/tmp/cookies.txt"
 # ══════════════════════════════════════════════════════
-
-
-# ── WRITE COOKIES FILE ───────────────────────────────
-def setup_cookies():
-    if YT_COOKIES:
-        with open(COOKIES_PATH, "w") as f:
-            f.write(YT_COOKIES)
-        print("   🍪 YouTube cookies loaded")
-    else:
-        print("   ⚠️  No cookies found — may get blocked")
 
 
 # ── SCHEDULE TIMES ───────────────────────────────────
@@ -151,32 +140,43 @@ def already_uploaded(keyword):
 # ── DOWNLOAD ─────────────────────────────────────────
 def download_video(video_id, index):
     print(f"   ⬇️  Downloading video {index}...")
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    out = f"/tmp/input_{index}.mp4"
 
-    opts = {
-        "format":              "best[ext=mp4]/bestvideo+bestaudio/best",
-        "outtmpl":             f"/tmp/input_{index}.%(ext)s",
-        "merge_output_format": "mp4",
-        "ignoreerrors":        False,
-        "no_warnings":         False,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+    try:
+        yt = YouTube(url, on_progress_callback=on_progress)
+
+        # Try progressive stream first (audio+video together)
+        stream = (
+            yt.streams
+              .filter(progressive=True, file_extension="mp4")
+              .order_by("resolution")
+              .last()
+        )
+
+        # If no progressive stream found try any mp4
+        if not stream:
+            stream = (
+                yt.streams
+                  .filter(file_extension="mp4")
+                  .order_by("resolution")
+                  .last()
             )
-        }
-    }
 
-    # Add cookies if available
-    if YT_COOKIES and os.path.exists(COOKIES_PATH):
-        opts["cookiefile"] = COOKIES_PATH
+        # If still nothing take whatever is available
+        if not stream:
+            stream = yt.streams.first()
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([
-            f"https://www.youtube.com/watch?v={video_id}"
-        ])
-    print(f"   ✅ Download {index} done")
-    return f"/tmp/input_{index}.mp4"
+        stream.download(
+            output_path="/tmp",
+            filename=f"input_{index}.mp4"
+        )
+        print(f"   ✅ Download {index} done — {stream.resolution}")
+        return out
+
+    except Exception as e:
+        print(f"   ❌ Download failed: {e}")
+        raise
 
 
 # ── BEST MOMENT ──────────────────────────────────────
@@ -368,10 +368,8 @@ def run():
     print(f"   🔍 Search: {SEARCH}")
     print("   🎨 Cyber Yellow · Bold Italic · Size 22")
     print("   🤖 AI: Google Gemini Free")
+    print("   ⬇️  Downloader: pytubefix")
     print("=" * 58)
-
-    # Setup cookies first
-    setup_cookies()
 
     slot1_time, slot2_time = get_schedule_times()
     print(f"\n📅 Short 1 → 4:00 PM IST")
