@@ -4,9 +4,8 @@ import json
 import urllib.request
 from datetime import datetime
 import pytz
+import yt_dlp
 import whisper
-from pytubefix import YouTube
-from pytubefix.cli import on_progress
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
@@ -16,11 +15,21 @@ API_KEY      = os.environ["YT_API_KEY"]
 CHANNEL_ID   = os.environ["MY_CHANNEL_ID"]
 TOKEN_JSON   = os.environ["OAUTH_TOKEN"]
 GEMINI_KEY   = os.environ["GEMINI_API_KEY"]
+YT_COOKIES   = os.environ.get("YT_COOKIES", "")
 REPO_NAME    = "podcast-auto-clipper"
 LOGO_PATH    = f"/home/runner/work/{REPO_NAME}/{REPO_NAME}/logo.png"
 SEARCH       = "raj shamani viral podcast"
 IST          = pytz.timezone("Asia/Kolkata")
+COOKIES_PATH = "/tmp/cookies.txt"
 # ══════════════════════════════════════════════════════
+
+
+# ── WRITE COOKIES FILE ───────────────────────────────
+def setup_cookies():
+    if YT_COOKIES:
+        with open(COOKIES_PATH, "w") as f:
+            f.write(YT_COOKIES)
+        print("   🍪 Cookies loaded")
 
 
 # ── SCHEDULE TIMES ───────────────────────────────────
@@ -34,7 +43,7 @@ def get_schedule_times():
 
 # ── AI METADATA USING GEMINI (FREE) ──────────────────
 def generate_ai_metadata(transcript, slot):
-    print(f"   🤖 Gemini AI generating metadata for Short {slot}...")
+    print(f"   🤖 Gemini generating metadata for Short {slot}...")
 
     prompt = f"""You are a YouTube Shorts expert.
 Based on this podcast transcript, generate:
@@ -54,9 +63,7 @@ Reply ONLY in this exact JSON format, nothing else:
 }}"""
 
     payload = json.dumps({
-        "contents": [{
-            "parts": [{"text": prompt}]
-        }],
+        "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature":     0.7,
             "maxOutputTokens": 500
@@ -67,13 +74,10 @@ Reply ONLY in this exact JSON format, nothing else:
         "https://generativelanguage.googleapis.com/v1beta/"
         f"models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
     )
-
     req = urllib.request.Request(
-        url,
-        data=payload,
+        url, data=payload,
         headers={"Content-Type": "application/json"}
     )
-
     try:
         with urllib.request.urlopen(req) as resp:
             data = json.loads(resp.read().decode())
@@ -143,40 +147,39 @@ def download_video(video_id, index):
     url = f"https://www.youtube.com/watch?v={video_id}"
     out = f"/tmp/input_{index}.mp4"
 
-    try:
-        yt = YouTube(url, on_progress_callback=on_progress)
-
-        # Try progressive stream first (audio+video together)
-        stream = (
-            yt.streams
-              .filter(progressive=True, file_extension="mp4")
-              .order_by("resolution")
-              .last()
-        )
-
-        # If no progressive stream found try any mp4
-        if not stream:
-            stream = (
-                yt.streams
-                  .filter(file_extension="mp4")
-                  .order_by("resolution")
-                  .last()
+    opts = {
+        "format":   "best[ext=mp4]/best",
+        "outtmpl":  f"/tmp/input_{index}.%(ext)s",
+        "merge_output_format": "mp4",
+        "quiet":    False,
+        "no_warnings": False,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
             )
+        }
+    }
 
-        # If still nothing take whatever is available
-        if not stream:
-            stream = yt.streams.first()
+    # Add cookies if available
+    if YT_COOKIES and os.path.exists(COOKIES_PATH):
+        opts["cookiefile"] = COOKIES_PATH
+        print("   🍪 Using cookies")
 
-        stream.download(
-            output_path="/tmp",
-            filename=f"input_{index}.mp4"
-        )
-        print(f"   ✅ Download {index} done — {stream.resolution}")
-        return out
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
 
-    except Exception as e:
-        print(f"   ❌ Download failed: {e}")
-        raise
+    # Handle any extension
+    for ext in ["mp4", "webm", "mkv"]:
+        candidate = f"/tmp/input_{index}.{ext}"
+        if os.path.exists(candidate):
+            if candidate != out:
+                os.rename(candidate, out)
+            print(f"   ✅ Download {index} done")
+            return out
+
+    raise Exception("Downloaded file not found")
 
 
 # ── BEST MOMENT ──────────────────────────────────────
@@ -208,17 +211,6 @@ def make_captions(path, start, end, index):
     model  = whisper.load_model("tiny")
     result = model.transcribe(path)
 
-    # ── CAPTION STYLE ──────────────────────────────
-    # Font    : Arial Narrow
-    # Style   : Bold + Italic
-    # Size    : 22
-    # Color   : Cyber Yellow
-    # Outline : Black 3px
-    # Shadow  : 1px
-    # BG      : Transparent
-    # Position: Bottom center
-    # Text    : ALL CAPS
-    # ───────────────────────────────────────────────
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -288,7 +280,7 @@ def make_clip(path, start, end, index):
         ]
         print("   🖼️  Logo: top right")
     else:
-        print("   ⚠️  logo.png not found — no logo")
+        print("   ⚠️  No logo found")
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(start),
@@ -321,7 +313,6 @@ def upload_scheduled(clip, metadata, publish_time, slot):
         json.loads(TOKEN_JSON)
     )
     yt = build("youtube", "v3", credentials=creds)
-
     body = {
         "snippet": {
             "title":       metadata["title"][:90] + " #Shorts",
@@ -368,8 +359,9 @@ def run():
     print(f"   🔍 Search: {SEARCH}")
     print("   🎨 Cyber Yellow · Bold Italic · Size 22")
     print("   🤖 AI: Google Gemini Free")
-    print("   ⬇️  Downloader: pytubefix")
     print("=" * 58)
+
+    setup_cookies()
 
     slot1_time, slot2_time = get_schedule_times()
     print(f"\n📅 Short 1 → 4:00 PM IST")
@@ -381,21 +373,34 @@ def run():
     for vid_id, title in videos:
         if len(clips) == 2:
             break
+
         print(f"\n📹 Checking: {title[:52]}...")
+
         if already_uploaded(title[:25]):
             continue
-        index                  = len(clips) + 1
-        path                   = download_video(vid_id, index)
-        start, end, transcript = find_best_moment(path)
-        clip                   = make_clip(path, start, end, index)
-        metadata               = generate_ai_metadata(
-                                     transcript, index
-                                 )
-        clips.append((clip, metadata))
-        print(f"   ✅ Short {index} prepared")
+
+        # ── Try download — skip video if it fails ──
+        try:
+            index = len(clips) + 1
+            path  = download_video(vid_id, index)
+        except Exception as e:
+            print(f"   ⚠️  Skipping — download failed: {e}")
+            continue
+
+        # ── Try processing — skip if it fails ──
+        try:
+            start, end, transcript = find_best_moment(path)
+            clip                   = make_clip(path, start, end, index)
+            metadata               = generate_ai_metadata(transcript, index)
+            clips.append((clip, metadata))
+            print(f"   ✅ Short {index} prepared")
+        except Exception as e:
+            print(f"   ⚠️  Skipping — processing failed: {e}")
+            cleanup(index)
+            continue
 
     if not clips:
-        print("\nℹ️  All videos already uploaded today.")
+        print("\nℹ️  No videos could be processed today.")
         return
 
     print(f"\n📤 Scheduling Short 1 → 4:00 PM IST")
@@ -408,9 +413,10 @@ def run():
         cleanup(2)
 
     print("\n" + "=" * 58)
-    print("   ✅ BOTH SHORTS SCHEDULED!")
+    print("   ✅ DONE!")
     print("   📅 Short 1 → 4:00 PM IST")
-    print("   📅 Short 2 → 4:15 PM IST")
+    if len(clips) == 2:
+        print("   📅 Short 2 → 4:15 PM IST")
     print("=" * 58)
 
 
