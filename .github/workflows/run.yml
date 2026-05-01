@@ -26,6 +26,7 @@ jobs:
       - name: Install packages
         run: |
           pip install yt-dlp
+          apt-get install -y wget 2>/dev/null || true
           pip install faster-whisper
           pip install google-api-python-client
           pip install google-auth
