@@ -1,4 +1,4 @@
-import os, subprocess, glob, re, json, time, urllib.request
+import os, subprocess, glob, re, json, time, urllib.request, urllib.error
 from datetime import datetime
 import pytz
 from faster_whisper import WhisperModel
@@ -11,13 +11,11 @@ API_KEY      = os.environ["YT_API_KEY"]
 CHANNEL_ID   = os.environ["MY_CHANNEL_ID"]
 TOKEN_JSON   = os.environ["OAUTH_TOKEN"]
 GEMINI_KEY   = os.environ["GEMINI_API_KEY"]
-YT_COOKIES   = os.environ.get("YT_COOKIES", "")
 REPO_NAME    = "podcast-auto-clipper"
 BASE_PATH    = f"/home/runner/work/{REPO_NAME}/{REPO_NAME}"
 LOGO_PATH    = f"{BASE_PATH}/logo.png"
 SEARCH       = "raj shamani viral podcast"
 IST          = pytz.timezone("Asia/Kolkata")
-COOKIES_PATH = "/tmp/cookies.txt"
 
 # Caption style
 OUTPUT_W, OUTPUT_H = 1080, 1920
@@ -27,20 +25,22 @@ WORDS_PER_CHUNK    = 3
 CAPTION_MARGIN_V   = 190
 OUTLINE_SIZE       = 4
 HIGHLIGHT_COLOR    = "&H0000FFFF&"
+
+# Invidious public instances — tries each until one works
+INVIDIOUS_INSTANCES = [
+    "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
+    "https://iv.datura.network",
+    "https://invidious.privacydev.net",
+    "https://invidious.lunar.icu",
+    "https://yt.cdaut.de",
+    "https://invidious.fdn.fr",
+    "https://invidious.perennialte.ch",
+]
 # ══════════════════════════════════════════════════════
 
 RUN_START = time.time()
 def elapsed(): return f"[{time.time()-RUN_START:.0f}s]"
-
-
-# ── SETUP COOKIES ────────────────────────────────────
-def setup_cookies():
-    if YT_COOKIES:
-        with open(COOKIES_PATH, "w") as f:
-            f.write(YT_COOKIES)
-        print(f"{elapsed()} 🍪 Cookies loaded")
-    else:
-        print(f"{elapsed()} ⚠️  No cookies")
 
 
 # ── SCHEDULE TIMES ───────────────────────────────────
@@ -78,81 +78,131 @@ def already_uploaded(keyword):
     ).execute()
     exists = len(res.get("items", [])) > 0
     if exists:
-        print(f"{elapsed()}    ⏭  Already uploaded — skipping")
+        print(f"{elapsed()}    ⏭  Already uploaded")
     return exists
 
 
-# ── DOWNLOAD (your v5.0 method) ──────────────────────
+# ── GET DIRECT URL VIA INVIDIOUS API ─────────────────
+def get_stream_url(video_id):
+    """
+    Tries multiple Invidious instances to get
+    a direct MP4 stream URL — no yt-dlp needed
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept":     "application/json"
+    }
+
+    for instance in INVIDIOUS_INSTANCES:
+        try:
+            api_url = f"{instance}/api/v1/videos/{video_id}"
+            print(f"{elapsed()}    🔄 Trying: {instance}")
+
+            req = urllib.request.Request(api_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+
+            formats = data.get("formatStreams", [])
+
+            # Pick best quality MP4
+            best = None
+            for fmt in formats:
+                if fmt.get("container") == "mp4":
+                    quality = fmt.get("qualityLabel", "")
+                    if "720" in quality:
+                        best = fmt
+                        break
+                    elif "480" in quality and not best:
+                        best = fmt
+                    elif not best:
+                        best = fmt
+
+            # Also check adaptive formats for 720p+
+            if not best or "720" not in best.get("qualityLabel",""):
+                adaptive = data.get("adaptiveFormats", [])
+                for fmt in adaptive:
+                    if (fmt.get("container") == "mp4" and
+                        fmt.get("type","").startswith("video") and
+                        "720" in fmt.get("qualityLabel","")):
+                        best = fmt
+                        break
+
+            if best and best.get("url"):
+                url     = best["url"]
+                quality = best.get("qualityLabel", "unknown")
+                print(f"{elapsed()}    ✅ Got stream: {quality} from {instance}")
+                return url
+
+        except Exception as e:
+            print(f"{elapsed()}    ⚠️  {instance} failed: {e}")
+            continue
+
+    return None
+
+
+# ── DOWNLOAD VIA DIRECT URL ──────────────────────────
 def download_video(video_id):
-    print(f"{elapsed()} 📥 Downloading...")
+    print(f"{elapsed()} 📥 Getting direct stream URL...")
 
     # Clean old files
     for f in glob.glob("/tmp/source.*"):
         try: os.remove(f)
         except: pass
 
-    clean_url = f"https://www.youtube.com/watch?v={video_id}"
+    stream_url = get_stream_url(video_id)
 
-    FMT = (
-        "bestvideo[height<=1080][height>=720][ext=mp4]"
-        "+bestaudio[ext=m4a]"
-        "/bestvideo[height<=1080][height>=720]+bestaudio"
-        "/bestvideo[height>=720]+bestaudio"
-        "/bestvideo+bestaudio"
-        "/best"
-    )
+    if stream_url:
+        print(f"{elapsed()}    ⬇️  Downloading via direct URL...")
+        out = "/tmp/source.mp4"
+        try:
+            # Download with wget — reliable, no bot issues
+            result = subprocess.run([
+                "wget",
+                "-O", out,
+                "--user-agent", "Mozilla/5.0",
+                "--timeout", "60",
+                "--tries", "3",
+                "--quiet",
+                stream_url
+            ], capture_output=True, text=True, timeout=300)
 
-    cmd = [
-        "yt-dlp", "-f", FMT,
-        "-o", "/tmp/source.%(ext)s",
-        "--no-playlist",
-        "--merge-output-format", "mp4",
-        "--postprocessor-args", "ffmpeg:-c copy",
-        "--concurrent-fragments", "8",
-        "--retries", "3",
-        "--fragment-retries", "3",
-        "--http-headers",
-        "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36",
-    ]
+            if os.path.exists(out) and os.path.getsize(out) > 1_000_000:
+                mb = os.path.getsize(out) // 1_000_000
+                print(f"{elapsed()}    ✅ Downloaded {mb}MB via Invidious")
+                return out
+        except Exception as e:
+            print(f"{elapsed()}    ⚠️  wget failed: {e}")
 
-    # Add cookies if available
-    if YT_COOKIES and os.path.exists(COOKIES_PATH):
-        cmd += ["--cookies", COOKIES_PATH]
-
-    subprocess.run(cmd, capture_output=True, text=True)
-
-    src = [
-        f for f in glob.glob("/tmp/source.*")
-        if os.path.exists(f) and os.path.getsize(f) > 5_000_000
-    ]
-
-    # Fallback
-    if not src:
-        print(f"{elapsed()}    ⚠️  Fallback download...")
-        cmd2 = [
-            "yt-dlp", "-f", "bestvideo+bestaudio/best",
+    # Final fallback — yt-dlp with different extractor args
+    print(f"{elapsed()}    🔄 Last resort: yt-dlp with po-token bypass...")
+    try:
+        result = subprocess.run([
+            "yt-dlp",
+            "-f", "best[ext=mp4]/best",
             "-o", "/tmp/source.%(ext)s",
             "--no-playlist",
-            "--merge-output-format", "mp4",
-            "--postprocessor-args", "ffmpeg:-c copy",
-        ]
-        if YT_COOKIES and os.path.exists(COOKIES_PATH):
-            cmd2 += ["--cookies", COOKIES_PATH]
-        subprocess.run(cmd2, capture_output=True)
+            "--extractor-args", "youtube:skip=dash",
+            "--sleep-interval", "2",
+            "--max-sleep-interval", "5",
+            "--user-agent",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/16.0 Mobile/15E148 Safari/604.1",
+            f"https://www.youtube.com/watch?v={video_id}",
+        ], capture_output=True, text=True, timeout=180)
+
         src = [
             f for f in glob.glob("/tmp/source.*")
             if os.path.exists(f) and os.path.getsize(f) > 1_000_000
         ]
+        if src:
+            mb = os.path.getsize(src[0]) // 1_000_000
+            print(f"{elapsed()}    ✅ Downloaded {mb}MB via yt-dlp fallback")
+            return src[0]
+    except Exception as e:
+        print(f"{elapsed()}    ⚠️  yt-dlp fallback failed: {e}")
 
-    if not src:
-        raise Exception("Download failed")
-
-    source = src[0]
-    mb     = os.path.getsize(source) // 1_000_000
-    print(f"{elapsed()}    ✅ Downloaded {mb}MB → {source}")
-    return source
+    raise Exception("All download methods failed")
 
 
 # ── VIDEO HELPERS ────────────────────────────────────
@@ -216,8 +266,6 @@ def build_crop(src_w, src_h, side):
         x = (src_w - crop_w) // 2
     return f"crop={crop_w}:{src_h}:{x}:0,scale={OUTPUT_W}:{OUTPUT_H}"
 
-
-# ── FIND 2 MOMENTS ───────────────────────────────────
 def find_two_moments(duration):
     third = duration // 3
     s1    = max(0, third - 30)
@@ -230,7 +278,7 @@ def find_two_moments(duration):
     return (s1, e1), (s2, e2)
 
 
-# ── ASS CAPTIONS (your v5.0) ─────────────────────────
+# ── ASS CAPTIONS ─────────────────────────────────────
 def sec_to_ass(s):
     h=int(s//3600); m=int((s%3600)//60); sec=s%60
     return f"{h}:{m:02d}:{sec:05.2f}"
@@ -280,16 +328,12 @@ def make_ass(word_segs):
     return header + "\n".join(events) + "\n"
 
 
-# ── TRANSCRIBE (your v5.0) ───────────────────────────
+# ── TRANSCRIBE ───────────────────────────────────────
 def transcribe_clip(model, clip_path):
     print(f"{elapsed()}    🎤 Transcribing...")
     segs, info = model.transcribe(
-        clip_path,
-        beam_size=3,
-        vad_filter=True,
-        word_timestamps=True,
-        task="translate",
-        language="hi",
+        clip_path, beam_size=3, vad_filter=True,
+        word_timestamps=True, task="translate", language="hi",
     )
     word_segs = []
     full_text = []
@@ -299,11 +343,7 @@ def transcribe_clip(model, clip_path):
             for w in seg.words:
                 wd = w.word.strip()
                 if wd and not re.match(r'^[^\w]+$', wd):
-                    word_segs.append({
-                        "word":  wd,
-                        "start": w.start,
-                        "end":   w.end
-                    })
+                    word_segs.append({"word":wd,"start":w.start,"end":w.end})
         else:
             words = [w for w in seg.text.strip().split() if w]
             if words:
@@ -314,27 +354,22 @@ def transcribe_clip(model, clip_path):
                         "start": seg.start + k * d,
                         "end":   seg.start + (k+1) * d
                     })
-    transcript = " ".join(full_text)
     print(f"{elapsed()}    ✅ {len(word_segs)} words")
-    return word_segs, transcript
+    return word_segs, " ".join(full_text)
 
 
-# ── MAKE CLIP + LOGO ─────────────────────────────────
+# ── MAKE CLIP ────────────────────────────────────────
 def make_clip(source, start, end, word_segs, vf_crop, index):
     print(f"{elapsed()}    ✂️  Making clip {index}...")
     raw = f"/tmp/raw_{index}.mp4"
     ass = f"/tmp/caps_{index}.ass"
     out = f"/tmp/clip_{index}.mp4"
-    dur = str(int(end - start))
 
-    # Extract raw clip
     subprocess.run(
-        ["ffmpeg","-y","-ss",str(start),"-t",dur,
-         "-i",source,"-c","copy", raw],
+        ["ffmpeg","-y","-ss",str(start),"-t",str(int(end-start)),
+         "-i",source,"-c","copy",raw],
         capture_output=True
     )
-
-    # Write captions
     with open(ass,"w",encoding="utf-8") as f:
         f.write(make_ass(word_segs))
 
@@ -342,13 +377,11 @@ def make_clip(source, start, end, word_segs, vf_crop, index):
 
     if os.path.exists(LOGO_PATH):
         cmd = [
-            "ffmpeg","-y","-i", raw,"-i", LOGO_PATH,
+            "ffmpeg","-y","-i",raw,"-i",LOGO_PATH,
             "-filter_complex",
-            (
-                f"[0:v]{vf_full}[base];"
-                "[1:v]scale=120:-1[logo];"
-                "[base][logo]overlay=W-w-20:20"
-            ),
+            (f"[0:v]{vf_full}[base];"
+             "[1:v]scale=120:-1[logo];"
+             "[base][logo]overlay=W-w-20:20"),
             "-c:v","libx264","-preset","fast","-crf","17",
             "-maxrate","4000k","-bufsize","8000k",
             "-profile:v","high","-level","4.1",
@@ -356,11 +389,9 @@ def make_clip(source, start, end, word_segs, vf_crop, index):
             "-r","30","-pix_fmt","yuv420p",
             "-movflags","+faststart", out
         ]
-        print(f"{elapsed()}    🖼️  Logo: top right")
     else:
         cmd = [
-            "ffmpeg","-y","-i", raw,
-            "-vf", vf_full,
+            "ffmpeg","-y","-i",raw,"-vf",vf_full,
             "-c:v","libx264","-preset","fast","-crf","17",
             "-maxrate","4000k","-bufsize","8000k",
             "-c:a","aac","-b:a","192k","-ar","44100",
@@ -368,45 +399,42 @@ def make_clip(source, start, end, word_segs, vf_crop, index):
             "-movflags","+faststart", out
         ]
 
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    subprocess.run(cmd, capture_output=True)
 
     if not (os.path.exists(out) and os.path.getsize(out) > 200_000):
-        print(f"{elapsed()}    ⚠️  Retrying without captions...")
         subprocess.run([
-            "ffmpeg","-y","-i", raw,"-vf", vf_crop,
+            "ffmpeg","-y","-i",raw,"-vf",vf_crop,
             "-c:v","libx264","-preset","fast","-crf","17",
-            "-c:a","aac","-b:a","192k","-r","30",
-            "-pix_fmt","yuv420p", out,
+            "-c:a","aac","-b:a","192k",
+            "-r","30","-pix_fmt","yuv420p", out,
         ], capture_output=True)
 
     if os.path.exists(raw): os.remove(raw)
     mb = os.path.getsize(out)//1_000_000 if os.path.exists(out) else 0
-    print(f"{elapsed()}    ✅ Clip {index} ready — {mb}MB")
+    print(f"{elapsed()}    ✅ Clip {index} — {mb}MB")
     return out
 
 
-# ── GEMINI AI METADATA ───────────────────────────────
+# ── GEMINI METADATA ──────────────────────────────────
 def generate_ai_metadata(transcript, slot):
-    print(f"{elapsed()}    🤖 Gemini metadata for Short {slot}...")
-    prompt = f"""You are a YouTube Shorts expert.
-Based on this podcast transcript generate:
-1. Viral catchy title (max 90 chars, no clickbait)
-2. Compelling description (3-4 lines, hashtags at end)
-3. 10 relevant tags as JSON array
+    print(f"{elapsed()}    🤖 Gemini for Short {slot}...")
+    prompt = f"""YouTube Shorts expert. Based on transcript:
+1. Viral title (max 90 chars)
+2. Description (3-4 lines + hashtags)
+3. 10 tags as JSON array
 
 Transcript: {transcript[:1500]}
 
-Reply ONLY in this exact JSON, nothing else:
+Reply ONLY this JSON:
 {{
-  "title": "your title here",
-  "description": "your description here",
-  "tags": ["tag1","tag2","tag3","tag4","tag5",
-           "tag6","tag7","tag8","tag9","tag10"]
+  "title": "title here",
+  "description": "description here",
+  "tags": ["t1","t2","t3","t4","t5","t6","t7","t8","t9","t10"]
 }}"""
 
     payload = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 500}
+        "generationConfig": {"temperature":0.7,"maxOutputTokens":500}
     }).encode("utf-8")
 
     url = (
@@ -416,33 +444,33 @@ Reply ONLY in this exact JSON, nothing else:
     try:
         req = urllib.request.Request(
             url, data=payload,
-            headers={"Content-Type": "application/json"}
+            headers={"Content-Type":"application/json"}
         )
         with urllib.request.urlopen(req) as resp:
             data = json.loads(resp.read().decode())
             raw  = data["candidates"][0]["content"]["parts"][0]["text"].strip()
             raw  = raw.replace("```json","").replace("```","").strip()
             meta = json.loads(raw)
-            print(f"{elapsed()}    ✅ Title: {meta['title']}")
+            print(f"{elapsed()}    ✅ {meta['title']}")
             return meta
     except Exception as e:
-        print(f"{elapsed()}    ⚠️  Gemini failed ({e}) — default")
+        print(f"{elapsed()}    ⚠️  Gemini failed — default")
         return {
-            "title":       "Raj Shamani Best Moment You Must Watch",
-            "description": "Best moment from Raj Shamani!\n\n#Shorts #RajShamani #Podcast #Viral",
+            "title":       "Raj Shamani Best Moment",
+            "description": "Best podcast moment!\n\n#Shorts #RajShamani #Podcast #Viral",
             "tags":        ["rajshamani","podcast","shorts","viral","motivation",
                            "clips","interview","trending","fyp","podcastclips"]
         }
 
 
-# ── UPLOAD SCHEDULED ─────────────────────────────────
+# ── UPLOAD ───────────────────────────────────────────
 def upload_scheduled(clip, metadata, publish_time, slot):
     print(f"{elapsed()}    ⬆️  Scheduling Short {slot}...")
     creds = Credentials.from_authorized_user_info(json.loads(TOKEN_JSON))
-    yt    = build("youtube", "v3", credentials=creds)
+    yt    = build("youtube","v3",credentials=creds)
     body  = {
         "snippet": {
-            "title":       metadata["title"][:90] + " #Shorts",
+            "title":       metadata["title"][:90]+" #Shorts",
             "description": metadata["description"],
             "tags":        metadata["tags"],
             "categoryId":  "22"
@@ -457,8 +485,7 @@ def upload_scheduled(clip, metadata, publish_time, slot):
     r     = yt.videos().insert(
         part="snippet,status", body=body, media_body=media
     ).execute()
-    print(f"{elapsed()}    ✅ Scheduled!")
-    print(f"{elapsed()}    📅 Goes live: {publish_time}")
+    print(f"{elapsed()}    ✅ Scheduled → {publish_time}")
     print(f"{elapsed()}    🔗 youtube.com/watch?v={r['id']}")
 
 
@@ -481,15 +508,12 @@ def run():
     print(f"   🔍 {SEARCH}")
     print("="*58)
 
-    setup_cookies()
     slot1_time, slot2_time = get_schedule_times()
 
-    # Load Whisper once
-    print(f"\n{elapsed()} 🎤 Loading Whisper base...")
+    print(f"\n{elapsed()} 🎤 Loading Whisper...")
     model = WhisperModel("base", device="cpu", compute_type="int8")
     print(f"{elapsed()} ✅ Whisper ready")
 
-    # Find a video that downloads successfully
     videos = search_podcasts()
     source = None
     title  = ""
@@ -506,17 +530,15 @@ def run():
             continue
 
     if not source:
-        print("\n❌ No video could be downloaded today.")
+        print("\n❌ No video downloaded today.")
         return
 
-    # Video properties
     src_w, src_h = video_dims(source)
     n_ch         = audio_channels(source)
     is_landscape = src_w > src_h
     duration     = get_duration(source)
     print(f"{elapsed()} 📐 {src_w}×{src_h} {n_ch}ch {duration:.0f}s")
 
-    # Speaker crop
     if is_landscape:
         side    = speaker_side(source) if n_ch >= 2 else "center"
         vf_crop = build_crop(src_w, src_h, side)
@@ -528,7 +550,6 @@ def run():
             f"pad={OUTPUT_W}:{OUTPUT_H}:(ow-iw)/2:(oh-ih)/2:black"
         )
 
-    # Find 2 moments
     (s1,e1),(s2,e2) = find_two_moments(duration)
 
     # Short 1
@@ -540,10 +561,10 @@ def run():
          "-i",source,"-c","copy",raw1],
         capture_output=True
     )
-    word_segs1, transcript1 = transcribe_clip(model, raw1)
+    ws1, t1 = transcribe_clip(model, raw1)
     if os.path.exists(raw1): os.remove(raw1)
-    clip1 = make_clip(source, s1, e1, word_segs1, vf_crop, 1)
-    meta1 = generate_ai_metadata(transcript1, 1)
+    clip1 = make_clip(source, s1, e1, ws1, vf_crop, 1)
+    meta1 = generate_ai_metadata(t1, 1)
 
     # Short 2
     print(f"\n{'─'*50}")
@@ -554,24 +575,22 @@ def run():
          "-i",source,"-c","copy",raw2],
         capture_output=True
     )
-    word_segs2, transcript2 = transcribe_clip(model, raw2)
+    ws2, t2 = transcribe_clip(model, raw2)
     if os.path.exists(raw2): os.remove(raw2)
-    clip2 = make_clip(source, s2, e2, word_segs2, vf_crop, 2)
-    meta2 = generate_ai_metadata(transcript2, 2)
+    clip2 = make_clip(source, s2, e2, ws2, vf_crop, 2)
+    meta2 = generate_ai_metadata(t2, 2)
 
     # Upload
     print(f"\n{'─'*50}")
     upload_scheduled(clip1, meta1, slot1_time, 1)
     upload_scheduled(clip2, meta2, slot2_time, 2)
-
     cleanup()
 
     total = time.time() - RUN_START
     print(f"\n{'='*58}")
     print(f"   ✅ BOTH SHORTS SCHEDULED!")
     print(f"   🎬 {title[:45]}")
-    print(f"   📅 Short 1 → 4:00 PM IST")
-    print(f"   📅 Short 2 → 4:15 PM IST")
+    print(f"   📅 4:00 PM + 4:15 PM IST")
     print(f"   ⏱  {int(total//60)}m {int(total%60)}s")
     print(f"{'='*58}")
 
